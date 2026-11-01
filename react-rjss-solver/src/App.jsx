@@ -1,6 +1,16 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+﻿import { useCallback, useMemo, useRef, useState } from "react";
+import Board from "./components/Board.jsx";
+import NumberPad from "./components/NumberPad.jsx";
+import Timer, { formatTime } from "./components/Timer.jsx";
 import {
-  createEmptyBoard,
+  SIZE,
+  createFreshState,
+  gameReducer,
+  getElapsedSeconds,
+  withCell,
+} from "./gameReducer.js";
+import { usePersistedReducer } from "./hooks/usePersistedReducer.js";
+import {
   generatePuzzle,
   getConflictingCells,
   solveSudoku,
@@ -8,12 +18,7 @@ import {
 } from "./sudoku.js";
 
 const STORAGE_KEY = "sudokuklar-state-v1";
-const SIZE = 9;
-const DEFAULT_BEST_TIMES = Object.freeze({
-  easy: null,
-  medium: null,
-  hard: null,
-});
+const DIFFICULTIES = ["easy", "medium", "hard"];
 const EXAMPLE_BOARD = [
   [5, 3, 0, 0, 7, 0, 0, 0, 0],
   [6, 0, 0, 1, 9, 5, 0, 0, 0],
@@ -25,17 +30,6 @@ const EXAMPLE_BOARD = [
   [0, 0, 0, 4, 1, 9, 0, 0, 5],
   [0, 0, 0, 0, 8, 0, 0, 7, 9],
 ];
-
-function createFreshState() {
-  return {
-    board: createEmptyBoard(),
-    locked: [],
-    difficulty: "medium",
-    elapsedSeconds: 0,
-    startedAt: null,
-    bestTimes: { ...DEFAULT_BEST_TIMES },
-  };
-}
 
 function isSavedStateValid(saved) {
   return (
@@ -56,13 +50,13 @@ function isSavedStateValid(saved) {
       (position) =>
         Number.isInteger(position) && position >= 0 && position < SIZE * SIZE,
     ) &&
-    ["easy", "medium", "hard"].includes(saved.difficulty) &&
+    DIFFICULTIES.includes(saved.difficulty) &&
     Number.isFinite(saved.elapsedSeconds) &&
     saved.elapsedSeconds >= 0 &&
     (saved.startedAt === null || Number.isFinite(saved.startedAt)) &&
     saved.bestTimes !== null &&
     typeof saved.bestTimes === "object" &&
-    ["easy", "medium", "hard"].every(
+    DIFFICULTIES.every(
       (difficulty) =>
         saved.bestTimes[difficulty] === null ||
         (Number.isInteger(saved.bestTimes[difficulty]) &&
@@ -72,30 +66,25 @@ function isSavedStateValid(saved) {
 }
 
 function readSavedState() {
+  const fresh = (message, kind) => ({
+    game: createFreshState(),
+    status: { message, kind },
+  });
   try {
     const raw = window.localStorage.getItem(STORAGE_KEY);
     if (raw === null) {
-      return {
-        game: createFreshState(),
-        status: {
-          message:
-            "Escribe del 1 al 9. Deja vacías las casillas que quieras resolver.",
-          kind: "info",
-        },
-      };
+      return fresh(
+        "Escribe del 1 al 9. Deja vacías las casillas que quieras resolver.",
+        "info",
+      );
     }
-
     const saved = JSON.parse(raw);
     if (!isSavedStateValid(saved)) {
-      return {
-        game: createFreshState(),
-        status: {
-          message: "El progreso guardado no es válido. Se abrió un tablero nuevo.",
-          kind: "error",
-        },
-      };
+      return fresh(
+        "El progreso guardado no es válido. Se abrió un tablero nuevo.",
+        "error",
+      );
     }
-
     return {
       game: saved,
       status: {
@@ -105,42 +94,11 @@ function readSavedState() {
     };
   } catch (error) {
     console.error("No se pudo leer el Sudoku guardado.", error);
-    return {
-      game: createFreshState(),
-      status: {
-        message:
-          "No se pudo leer el progreso guardado. Se abrió un tablero nuevo.",
-        kind: "error",
-      },
-    };
+    return fresh(
+      "No se pudo leer el progreso guardado. Se abrió un tablero nuevo.",
+      "error",
+    );
   }
-}
-
-function getFilledPositions(board) {
-  const positions = [];
-  board.forEach((row, rowIndex) => {
-    row.forEach((value, columnIndex) => {
-      if (value !== 0) {
-        positions.push(rowIndex * SIZE + columnIndex);
-      }
-    });
-  });
-  return positions;
-}
-
-function getElapsedSeconds(game) {
-  return (
-    game.elapsedSeconds +
-    (game.startedAt === null
-      ? 0
-      : Math.floor((Date.now() - game.startedAt) / 1000))
-  );
-}
-
-function formatTime(totalSeconds) {
-  const minutes = Math.floor(totalSeconds / 60);
-  const seconds = totalSeconds % 60;
-  return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
 }
 
 function getDifficultyLabel(difficulty) {
@@ -151,80 +109,56 @@ function getDifficultyLabel(difficulty) {
   }[difficulty];
 }
 
-function getCellClassName({
-  isGiven,
-  isPeer,
-  isSame,
-  isConflict,
-}) {
-  return [
-    "cell",
-    isGiven && "is-given",
-    isPeer && "is-peer",
-    isSame && "is-same",
-    isConflict && "is-conflict",
-  ]
-    .filter(Boolean)
-    .join(" ");
-}
-
 export default function App() {
   const [initial] = useState(readSavedState);
-  const [game, setGame] = useState(initial.game);
   const [status, setStatus] = useState(initial.status);
+  const [game, dispatch] = usePersistedReducer(
+    gameReducer,
+    STORAGE_KEY,
+    () => initial.game,
+    () =>
+      setStatus({
+        message:
+          "No se pudo guardar el progreso. Revisa el almacenamiento del navegador.",
+        kind: "error",
+      }),
+  );
   const [selectedCell, setSelectedCell] = useState(-1);
-  const [, setClockTick] = useState(0);
   const cellRefs = useRef([]);
 
   const conflicts = useMemo(
     () => getConflictingCells(game.board),
     [game.board],
   );
-  const selectedRow = Math.floor(selectedCell / SIZE);
-  const selectedColumn = selectedCell % SIZE;
-  const selectedValue =
-    selectedCell < 0
-      ? 0
-      : (game.board[selectedRow]?.[selectedColumn] ?? 0);
-  const elapsedSeconds = getElapsedSeconds(game);
 
-  useEffect(() => {
-    const intervalId = window.setInterval(() => {
-      setClockTick((tick) => tick + 1);
-    }, 1000);
-    return () => window.clearInterval(intervalId);
+  const registerRef = useCallback((position, element) => {
+    cellRefs.current[position] = element;
   }, []);
 
-  useEffect(() => {
-    try {
-      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(game));
-    } catch (error) {
-      console.error("No se pudo guardar el Sudoku en el navegador.", error);
-      setStatus({
-        message:
-          "No se pudo guardar el progreso. Revisa el almacenamiento del navegador.",
-        kind: "error",
-      });
-    }
-  }, [game]);
+  const focusCell = useCallback((position) => {
+    cellRefs.current[position]?.focus();
+  }, []);
 
-  function updateCell(position, value) {
-    const row = Math.floor(position / SIZE);
-    const column = position % SIZE;
-    setGame((current) => ({
-      ...current,
-      board: current.board.map((boardRow, rowIndex) =>
-        rowIndex === row
-          ? boardRow.map((cell, columnIndex) =>
-              columnIndex === column ? value : cell,
-            )
-          : boardRow,
-      ),
-      startedAt:
-        value !== 0 && current.startedAt === null
-          ? Date.now()
-          : current.startedAt,
-    }));
+  function applyValue(position, value) {
+    const nextBoard = withCell(game.board, position, value);
+    const validation = validateBoard(nextBoard);
+    if (validation.valid && nextBoard.every((row) => row.every(Boolean))) {
+      finishGame(nextBoard);
+      return;
+    }
+    dispatch({ type: "set-cell", position, value });
+    setStatus(
+      validation.valid
+        ? {
+            message:
+              "Sin conflictos por ahora. Puedes seguir completando el tablero.",
+            kind: "success",
+          }
+        : {
+            message: `Hay conflictos: ${validation.errors[0]}`,
+            kind: "error",
+          },
+    );
   }
 
   function handleCellChange(position, rawValue) {
@@ -240,40 +174,16 @@ export default function App() {
       });
       return;
     }
-
-    updateCell(position, value === "" || value === "0" ? 0 : Number(value));
-    const nextBoard = game.board.map((row) => row.slice());
-    const row = Math.floor(position / SIZE);
-    const column = position % SIZE;
-    nextBoard[row][column] =
-      value === "" || value === "0" ? 0 : Number(value);
-    const validation = validateBoard(nextBoard);
-    setStatus(
-      validation.valid
-        ? {
-            message:
-              "Sin conflictos por ahora. Puedes seguir completando el tablero.",
-            kind: "success",
-          }
-        : {
-            message: `Hay conflictos: ${validation.errors[0]}`,
-            kind: "error",
-          },
-    );
+    applyValue(position, value === "" || value === "0" ? 0 : Number(value));
   }
 
   function handleCellKeyDown(event, position) {
-    const offsets = {
-      ArrowUp: -SIZE,
-      ArrowDown: SIZE,
-    };
+    const offsets = { ArrowUp: -SIZE, ArrowDown: SIZE };
     if (Object.hasOwn(offsets, event.key)) {
       event.preventDefault();
-      const nextPosition = Math.max(
-        0,
-        Math.min(SIZE * SIZE - 1, position + offsets[event.key]),
+      focusCell(
+        Math.max(0, Math.min(SIZE * SIZE - 1, position + offsets[event.key])),
       );
-      cellRefs.current[nextPosition]?.focus();
       return;
     }
 
@@ -281,11 +191,11 @@ export default function App() {
       event.preventDefault();
       const rowStart = Math.floor(position / SIZE) * SIZE;
       const rowEnd = rowStart + SIZE - 1;
-      const nextPosition =
+      focusCell(
         event.key === "ArrowLeft"
           ? Math.max(rowStart, position - 1)
-          : Math.min(rowEnd, position + 1);
-      cellRefs.current[nextPosition]?.focus();
+          : Math.min(rowEnd, position + 1),
+      );
       return;
     }
 
@@ -293,20 +203,32 @@ export default function App() {
       (event.key === "Backspace" || event.key === "Delete") &&
       !game.locked.includes(position)
     ) {
-      updateCell(position, 0);
+      dispatch({ type: "set-cell", position, value: 0 });
       setStatus({ message: "Casilla vacía.", kind: "info" });
     }
   }
 
+  function handlePadPick(digit) {
+    if (selectedCell < 0) {
+      setStatus({
+        message: "Primero elige una casilla del tablero.",
+        kind: "info",
+      });
+      return;
+    }
+    if (game.locked.includes(selectedCell)) {
+      setStatus({
+        message: "Esa casilla es un número inicial y no se puede cambiar.",
+        kind: "error",
+      });
+      return;
+    }
+    applyValue(selectedCell, digit);
+    focusCell(selectedCell);
+  }
+
   function loadPuzzle(board, difficulty) {
-    setGame((current) => ({
-      board: board.map((row) => row.slice()),
-      locked: getFilledPositions(board),
-      difficulty,
-      elapsedSeconds: 0,
-      startedAt: Date.now(),
-      bestTimes: current.bestTimes,
-    }));
+    dispatch({ type: "load-puzzle", board, difficulty });
     setSelectedCell(-1);
   }
 
@@ -335,40 +257,47 @@ export default function App() {
     }, 20);
   }
 
-  function handleSolve() {
+  function getSolutionOrReport(noSolutionMessage) {
     const validation = validateBoard(game.board);
     if (!validation.valid) {
       setStatus({
         message: validation.errors.slice(0, 3).join(" "),
         kind: "error",
       });
-      return;
+      return null;
     }
-
     const solution = solveSudoku(game.board);
     if (!solution) {
-      setStatus({
-        message:
-          "Este tablero no tiene solución. Revisa los números que ingresaste.",
-        kind: "error",
-      });
+      setStatus({ message: noSolutionMessage, kind: "error" });
+      return null;
+    }
+    return solution;
+  }
+
+  function handleSolve() {
+    const solution = getSolutionOrReport(
+      "Este tablero no tiene solución. Revisa los números que ingresaste.",
+    );
+    if (!solution) {
       return;
     }
 
-    const solveTime = elapsedSeconds;
+    finishGame(solution);
+  }
+
+  function finishGame(solution) {
+    const solveTime = getElapsedSeconds(game);
     const previousBest = game.bestTimes[game.difficulty];
     const isNewBest = previousBest === null || solveTime < previousBest;
-    const bestTimes = {
-      ...game.bestTimes,
-      [game.difficulty]: isNewBest ? solveTime : previousBest,
-    };
-    setGame((current) => ({
-      ...current,
-      board: solution,
+    dispatch({
+      type: "solve",
+      solution,
       elapsedSeconds: solveTime,
-      startedAt: null,
-      bestTimes,
-    }));
+      bestTimes: {
+        ...game.bestTimes,
+        [game.difficulty]: isNewBest ? solveTime : previousBest,
+      },
+    });
     setStatus({
       message: isNewBest
         ? `¡Sudoku resuelto en ${formatTime(
@@ -382,28 +311,14 @@ export default function App() {
   }
 
   function handleHint() {
-    const validation = validateBoard(game.board);
-    if (!validation.valid) {
-      setStatus({
-        message: validation.errors.slice(0, 3).join(" "),
-        kind: "error",
-      });
-      return;
-    }
-
-    const solution = solveSudoku(game.board);
+    const solution = getSolutionOrReport(
+      "No hay una solución posible para este tablero. Revisa tus números.",
+    );
     if (!solution) {
-      setStatus({
-        message:
-          "No hay una solución posible para este tablero. Revisa tus números.",
-        kind: "error",
-      });
       return;
     }
 
-    const position = game.board
-      .flat()
-      .findIndex((value) => value === 0);
+    const position = game.board.flat().findIndex((value) => value === 0);
     if (position === -1) {
       setStatus({ message: "El tablero ya está completo.", kind: "success" });
       return;
@@ -411,33 +326,27 @@ export default function App() {
 
     const row = Math.floor(position / SIZE);
     const column = position % SIZE;
-    const nextBoard = game.board.map((boardRow) => boardRow.slice());
-    nextBoard[row][column] = solution[row][column];
-    setGame((current) => ({
-      ...current,
-      board: nextBoard,
-      startedAt: current.startedAt === null ? Date.now() : current.startedAt,
-    }));
+    const nextBoard = withCell(game.board, position, solution[row][column]);
+    if (nextBoard.every((boardRow) => boardRow.every(Boolean))) {
+      finishGame(nextBoard);
+      return;
+    }
+    dispatch({ type: "set-cell", position, value: solution[row][column] });
     setSelectedCell(position);
     setStatus({
       message: `Pista: fila ${row + 1}, columna ${column + 1}.`,
       kind: "success",
     });
-    window.requestAnimationFrame(() => cellRefs.current[position]?.focus());
+    window.requestAnimationFrame(() => focusCell(position));
   }
 
   function handleClear() {
-    setGame((current) => ({
-      ...createFreshState(),
-      difficulty: current.difficulty,
-      bestTimes: current.bestTimes,
-    }));
+    dispatch({ type: "clear" });
     setSelectedCell(-1);
-    setStatus({ message: "Tablero limpio. Escribe un Sudoku para comenzar." });
-  }
-
-  function handleDifficultyChange(event) {
-    setGame((current) => ({ ...current, difficulty: event.target.value }));
+    setStatus({
+      message: "Tablero limpio. Escribe un Sudoku para comenzar.",
+      kind: "info",
+    });
   }
 
   return (
@@ -454,7 +363,7 @@ export default function App() {
             Sudo<span className="brand-accent">Klar</span>
           </span>
         </a>
-        <span className="topbar-note">UN CLÁSICO, RESUELTO CON LÓGICA</span>
+        <span className="topbar-note">SUDOKU · REACT JS</span>
       </header>
 
       <main>
@@ -462,12 +371,12 @@ export default function App() {
           <div className="intro-copy">
             <p className="eyebrow">
               <span className="eyebrow-dot" />
-              TU ESPACIO DE SUDOKU
+              COMPONENTES · HOOKS · ESTADO
             </p>
             <h1 id="page-title">
-              Un poco de lógica.
+              Sudoku hecho
               <br />
-              <span>Mucho de calma.</span>
+              <span>con React.</span>
             </h1>
             <p className="intro-description">
               Resuelve el tablero a tu ritmo o deja que el algoritmo encuentre
@@ -475,11 +384,7 @@ export default function App() {
             </p>
           </div>
           <div className="intro-decoration" aria-hidden="true">
-            <span>9</span>
-            <span>·</span>
-            <span>3</span>
-            <span>·</span>
-            <span>1</span>
+            <span className="react-atom">⚛</span>
           </div>
         </section>
 
@@ -487,72 +392,24 @@ export default function App() {
           <div className="board-card">
             <div className="board-heading">
               <div>
-                <p className="section-kicker">EL TABLERO</p>
+                <p className="section-kicker">&lt;Board /&gt;</p>
                 <h2>Tu Sudoku</h2>
               </div>
-              <div className="timer" aria-label="Tiempo de juego">
-                <span className="timer-icon" aria-hidden="true" />
-                <span role="timer">{formatTime(elapsedSeconds)}</span>
-              </div>
+              <Timer game={game} />
             </div>
 
-            <div
-              className="sudoku-board"
-              role="grid"
-              aria-label="Tablero de Sudoku de 9 por 9"
-            >
-              {game.board.map((row, rowIndex) => (
-                <div className="board-row" role="row" key={rowIndex}>
-                  {row.map((value, columnIndex) => {
-                    const position = rowIndex * SIZE + columnIndex;
-                    const isGiven = game.locked.includes(position);
-                    const isPeer =
-                      selectedCell >= 0 &&
-                      position !== selectedCell &&
-                      (rowIndex === selectedRow ||
-                        columnIndex === selectedColumn ||
-                        (Math.floor(rowIndex / 3) ===
-                          Math.floor(selectedRow / 3) &&
-                          Math.floor(columnIndex / 3) ===
-                            Math.floor(selectedColumn / 3)));
-                    return (
-                      <input
-                        key={position}
-                        ref={(element) => {
-                          cellRefs.current[position] = element;
-                        }}
-                        className={getCellClassName({
-                          isGiven,
-                          isPeer,
-                          isSame: value !== 0 && value === selectedValue,
-                          isConflict: conflicts.has(position),
-                        })}
-                        type="text"
-                        inputMode="numeric"
-                        autoComplete="off"
-                        maxLength={1}
-                        spellCheck={false}
-                        role="gridcell"
-                        aria-label={`Fila ${rowIndex + 1}, columna ${
-                          columnIndex + 1
-                        }`}
-                        aria-readonly={isGiven}
-                        readOnly={isGiven}
-                        value={value === 0 ? "" : String(value)}
-                        data-position={position}
-                        onChange={(event) =>
-                          handleCellChange(position, event.target.value)
-                        }
-                        onFocus={() => setSelectedCell(position)}
-                        onKeyDown={(event) =>
-                          handleCellKeyDown(event, position)
-                        }
-                      />
-                    );
-                  })}
-                </div>
-              ))}
-            </div>
+            <Board
+              board={game.board}
+              locked={game.locked}
+              conflicts={conflicts}
+              selectedCell={selectedCell}
+              registerRef={registerRef}
+              onChange={handleCellChange}
+              onSelect={setSelectedCell}
+              onKeyDown={handleCellKeyDown}
+            />
+
+            <NumberPad disabled={selectedCell < 0} onPick={handlePadPick} />
 
             <div className="board-legend" aria-label="Leyenda del tablero">
               <span>
@@ -568,7 +425,7 @@ export default function App() {
 
           <aside className="control-card" aria-labelledby="controls-title">
             <div className="control-heading">
-              <p className="section-kicker">A TU MANERA</p>
+              <p className="section-kicker">&lt;Controls /&gt;</p>
               <h2 id="controls-title">¿Qué hacemos?</h2>
               <p>Ingresa un tablero, practica o genera un reto nuevo.</p>
             </div>
@@ -581,11 +438,18 @@ export default function App() {
                 id="difficulty"
                 name="difficulty"
                 value={game.difficulty}
-                onChange={handleDifficultyChange}
+                onChange={(event) =>
+                  dispatch({
+                    type: "set-difficulty",
+                    difficulty: event.target.value,
+                  })
+                }
               >
-                <option value="easy">Tranquilo</option>
-                <option value="medium">Intermedio</option>
-                <option value="hard">Desafiante</option>
+                {DIFFICULTIES.map((difficulty) => (
+                  <option key={difficulty} value={difficulty}>
+                    {getDifficultyLabel(difficulty)}
+                  </option>
+                ))}
               </select>
               <span className="select-chevron" aria-hidden="true" />
             </div>
@@ -661,7 +525,7 @@ export default function App() {
             <span className="feature-number">01</span>
             <div>
               <h3>Completa</h3>
-              <p>Usa el tablero o carga un reto para empezar.</p>
+              <p>Usa el tablero, el teclado o carga un reto para empezar.</p>
             </div>
           </div>
           <div className="feature">
@@ -682,7 +546,7 @@ export default function App() {
       </main>
 
       <footer>
-        <span>Hecho para pensar con calma.</span>
+        <span>Hecho con React, hooks y componentes.</span>
         <span>
           React · <a href="./LICENSE">Licencia MIT</a>
         </span>
